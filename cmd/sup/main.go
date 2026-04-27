@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -12,9 +13,13 @@ import (
 	"text/tabwriter"
 	"time"
 
+	hcplugin "github.com/hashicorp/go-plugin"
 	"github.com/mikkeloscar/sshconfig"
 	"github.com/pkg/errors"
 	"github.com/pressly/sup"
+
+	// Importer le package shared de ton plugin
+	"github.com/maelanjais/sup-hcl2-plugin/shared"
 )
 
 var (
@@ -29,6 +34,9 @@ var (
 
 	showVersion bool
 	showHelp    bool
+
+	// NOUVEAU: chemin vers le binaire plugin HCL2
+	hcl2ParserPath string
 
 	ErrUsage            = errors.New("Usage: sup [OPTIONS] NETWORK COMMAND [...]\n       sup [ --help | -v | --version ]")
 	ErrUnknownNetwork   = errors.New("Unknown network")
@@ -50,7 +58,7 @@ func (f *flagStringSlice) Set(value string) error {
 }
 
 func init() {
-	flag.StringVar(&supfile, "f", "", "Custom path to ./Supfile[.yml]")
+	flag.StringVar(&supfile, "f", "", "Custom path to ./Supfile[.yml|.hcl]")
 	flag.Var(&envVars, "e", "Set environment variables")
 	flag.Var(&envVars, "env", "Set environment variables")
 	flag.StringVar(&sshConfig, "sshconfig", "", "Read SSH Config file, ie. ~/.ssh/config file")
@@ -65,14 +73,50 @@ func init() {
 	flag.BoolVar(&showVersion, "version", false, "Print version")
 	flag.BoolVar(&showHelp, "h", false, "Show help")
 	flag.BoolVar(&showHelp, "help", false, "Show help")
+
+	// NOUVEAU: flag pour le chemin du plugin
+	flag.StringVar(&hcl2ParserPath, "parser", "", "Path to HCL2 parser plugin binary")
+}
+
+// NOUVEAU: parseHCLViaPlugin lance le plugin et convertit HCL → YAML bytes
+func parseHCLViaPlugin(hclFilePath string) ([]byte, error) {
+	// Trouver le binaire plugin
+	parserBin := hcl2ParserPath
+	if parserBin == "" {
+		// Chercher dans le PATH par défaut
+		var err error
+		parserBin, err = exec.LookPath("sup-hcl2-parser")
+		if err != nil {
+			return nil, fmt.Errorf("HCL2 parser plugin not found. Install it or use --parser flag: %v", err)
+		}
+	}
+
+	// Lancer le plugin via go-plugin
+	client := hcplugin.NewClient(&hcplugin.ClientConfig{
+		HandshakeConfig: shared.Handshake,
+		Plugins:         shared.PluginMap,
+		Cmd:             exec.Command(parserBin),
+	})
+	defer client.Kill()
+
+	rpcClient, err := client.Client()
+	if err != nil {
+		return nil, fmt.Errorf("plugin connection failed: %v", err)
+	}
+
+	raw, err := rpcClient.Dispense("config_parser")
+	if err != nil {
+		return nil, fmt.Errorf("plugin dispense failed: %v", err)
+	}
+
+	parser := raw.(shared.ConfigParser)
+	return parser.ParseFile(hclFilePath)
 }
 
 func networkUsage(conf *sup.Supfile) {
 	w := &tabwriter.Writer{}
 	w.Init(os.Stderr, 4, 4, 2, ' ', 0)
 	defer w.Flush()
-
-	// Print available networks/hosts.
 	fmt.Fprintln(w, "Networks:\t")
 	for _, name := range conf.Networks.Names {
 		fmt.Fprintf(w, "- %v\n", name)
@@ -88,8 +132,6 @@ func cmdUsage(conf *sup.Supfile) {
 	w := &tabwriter.Writer{}
 	w.Init(os.Stderr, 4, 4, 2, ' ', 0)
 	defer w.Flush()
-
-	// Print available targets/commands.
 	fmt.Fprintln(w, "Targets:\t")
 	for _, name := range conf.Targets.Names {
 		cmds, _ := conf.Targets.Get(name)
@@ -104,25 +146,18 @@ func cmdUsage(conf *sup.Supfile) {
 	fmt.Fprintln(w)
 }
 
-// parseArgs parses args and returns network and commands to be run.
-// On error, it prints usage and exits.
 func parseArgs(conf *sup.Supfile) (*sup.Network, []*sup.Command, error) {
 	var commands []*sup.Command
-
 	args := flag.Args()
 	if len(args) < 1 {
 		networkUsage(conf)
 		return nil, nil, ErrUsage
 	}
-
-	// Does the <network> exist?
 	network, ok := conf.Networks.Get(args[0])
 	if !ok {
 		networkUsage(conf)
 		return nil, nil, ErrUnknownNetwork
 	}
-
-	// Parse CLI --env flag env vars, override values defined in Network env.
 	for _, env := range envVars {
 		if len(env) == 0 {
 			continue
@@ -136,51 +171,35 @@ func parseArgs(conf *sup.Supfile) (*sup.Network, []*sup.Command, error) {
 		}
 		network.Env.Set(env[:i], env[i+1:])
 	}
-
 	hosts, err := network.ParseInventory()
 	if err != nil {
 		return nil, nil, err
 	}
 	network.Hosts = append(network.Hosts, hosts...)
-
-	// Does the <network> have at least one host?
 	if len(network.Hosts) == 0 {
 		networkUsage(conf)
 		return nil, nil, ErrNetworkNoHosts
 	}
-
-	// Check for the second argument
 	if len(args) < 2 {
 		cmdUsage(conf)
 		return nil, nil, ErrUsage
 	}
-
-	// In case of the network.Env needs an initialization
 	if network.Env == nil {
 		network.Env = make(sup.EnvList, 0)
 	}
-
-	// Add default env variable with current network
 	network.Env.Set("SUP_NETWORK", args[0])
-
-	// Add default nonce
 	network.Env.Set("SUP_TIME", time.Now().UTC().Format(time.RFC3339))
 	if os.Getenv("SUP_TIME") != "" {
 		network.Env.Set("SUP_TIME", os.Getenv("SUP_TIME"))
 	}
-
-	// Add user
 	if os.Getenv("SUP_USER") != "" {
 		network.Env.Set("SUP_USER", os.Getenv("SUP_USER"))
 	} else {
 		network.Env.Set("SUP_USER", os.Getenv("USER"))
 	}
-
 	for _, cmd := range args[1:] {
-		// Target?
 		target, isTarget := conf.Targets.Get(cmd)
 		if isTarget {
-			// Loop over target's commands.
 			for _, cmd := range target {
 				command, isCommand := conf.Commands.Get(cmd)
 				if !isCommand {
@@ -191,20 +210,16 @@ func parseArgs(conf *sup.Supfile) (*sup.Network, []*sup.Command, error) {
 				commands = append(commands, &command)
 			}
 		}
-
-		// Command?
 		command, isCommand := conf.Commands.Get(cmd)
 		if isCommand {
 			command.Name = cmd
 			commands = append(commands, &command)
 		}
-
 		if !isTarget && !isCommand {
 			cmdUsage(conf)
 			return nil, nil, fmt.Errorf("%v: %v", ErrCmd, cmd)
 		}
 	}
-
 	return &network, commands, nil
 }
 
@@ -229,46 +244,64 @@ func main() {
 		flag.PrintDefaults()
 		return
 	}
-
 	if showVersion {
 		fmt.Fprintln(os.Stderr, sup.VERSION)
 		return
 	}
 
+	// ===== SECTION MODIFIÉE: Support HCL2 via plugin =====
 	if supfile == "" {
 		supfile = "./Supfile"
 	}
-	data, err := ioutil.ReadFile(resolvePath(supfile))
-	if err != nil {
-		firstErr := err
-		data, err = ioutil.ReadFile("./Supfile.yml") // Alternative to ./Supfile.
+
+	var data []byte
+	var err error
+	resolvedPath := resolvePath(supfile)
+
+	// Détecter l'extension .hcl
+	if strings.HasSuffix(resolvedPath, ".hcl") {
+		// Utiliser le plugin HCL2
+		data, err = parseHCLViaPlugin(resolvedPath)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, firstErr)
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(os.Stderr, "HCL2 plugin error:", err)
 			os.Exit(1)
 		}
+	} else {
+		// Fallback YAML classique
+		data, err = ioutil.ReadFile(resolvedPath)
+		if err != nil {
+			firstErr := err
+			data, err = ioutil.ReadFile("./Supfile.yml")
+			if err != nil {
+				// Tenter aussi .hcl en dernier recours
+				data, err = parseHCLViaPlugin("./Supfile.hcl")
+				if err != nil {
+					fmt.Fprintln(os.Stderr, firstErr)
+					os.Exit(1)
+				}
+			}
+		}
 	}
+	// ===== FIN SECTION MODIFIÉE =====
+
 	conf, err := sup.NewSupfile(data)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	// Parse network and commands to be run from args.
 	network, commands, err := parseArgs(conf)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	// --only flag filters hosts
 	if onlyHosts != "" {
 		expr, err := regexp.CompilePOSIX(onlyHosts)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-
 		var hosts []string
 		for _, host := range network.Hosts {
 			if expr.MatchString(host) {
@@ -282,14 +315,12 @@ func main() {
 		network.Hosts = hosts
 	}
 
-	// --except flag filters out hosts
 	if exceptHosts != "" {
 		expr, err := regexp.CompilePOSIX(exceptHosts)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-
 		var hosts []string
 		for _, host := range network.Hosts {
 			if !expr.MatchString(host) {
@@ -297,30 +328,24 @@ func main() {
 			}
 		}
 		if len(hosts) == 0 {
-			fmt.Fprintln(os.Stderr, fmt.Errorf("no hosts left after --except '%v' regexp", onlyHosts))
+			fmt.Fprintln(os.Stderr, fmt.Errorf("no hosts left after --except '%v' regexp", exceptHosts))
 			os.Exit(1)
 		}
 		network.Hosts = hosts
 	}
 
-	// --sshconfig flag location for ssh_config file
 	if sshConfig != "" {
 		confHosts, err := sshconfig.ParseSSHConfig(resolvePath(sshConfig))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-
-		// flatten Host -> *SSHHost, not the prettiest
-		// but will do
 		confMap := map[string]*sshconfig.SSHHost{}
 		for _, conf := range confHosts {
 			for _, host := range conf.Host {
 				confMap[host] = conf
 			}
 		}
-
-		// check network.Hosts for match
 		for _, host := range network.Hosts {
 			conf, found := confMap[host]
 			if found {
@@ -340,7 +365,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Parse CLI --env flag env vars, define $SUP_ENV and override values defined in Supfile.
 	var cliVars sup.EnvList
 	for _, env := range envVars {
 		if len(env) == 0 {
@@ -357,15 +381,12 @@ func main() {
 		cliVars.Set(env[:i], env[i+1:])
 	}
 
-	// SUP_ENV is generated only from CLI env vars.
-	// Separate loop to omit duplicates.
 	supEnv := ""
 	for _, v := range cliVars {
 		supEnv += fmt.Sprintf(" -e %v=%q", v.Key, v.Value)
 	}
 	vars.Set("SUP_ENV", strings.TrimSpace(supEnv))
 
-	// Create new Stackup app.
 	app, err := sup.New(conf)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -374,7 +395,6 @@ func main() {
 	app.Debug(debug)
 	app.Prefix(!disablePrefix)
 
-	// Run all the commands in the given network.
 	err = app.Run(network, vars, commands...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
